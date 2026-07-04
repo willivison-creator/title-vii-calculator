@@ -37,30 +37,39 @@ class TitleVIIDamagesCalculator:
     def calculate_back_pay(self, start_date, end_date, base_annual_comp, adverse_action, 
                            actual_ongoing_rate, sought_promoted_rate, mitigation_jobs, actual_paid):
         duration = self._calculate_yearfrac(start_date, end_date)
+        is_separation = adverse_action in ["Termination / Discharge", "Constructive Discharge"]
         
-        # Dual-Rate Wage Differential Engine (Demotions / Failure to Promote)
-        if adverse_action in ["Failure to Promote/Hire", "Demotion with Pay Cut", "Compensation/Hours Reduction"]:
-            annual_deficit = max(0.0, sought_promoted_rate - actual_ongoing_rate)
-            total_expected_loss = duration * annual_deficit
-            total_mitigation = actual_paid
-            total_back_pay = max(0.0, total_expected_loss - total_mitigation)
-        else:
-            # Separation Actions (Termination / Constructive Discharge)
+        # 1. Base Expected Loss
+        if is_separation:
             total_expected_loss = duration * base_annual_comp
-            total_interim_earnings = 0.0
+            baseline_ongoing_earnings = 0.0
+        else:
+            total_expected_loss = duration * sought_promoted_rate
+            baseline_ongoing_earnings = duration * actual_ongoing_rate
             
-            for _, job in mitigation_jobs.iterrows():
-                if pd.isnull(job['Start Date']) or pd.isnull(job['End Date']):
-                    continue
-                job_annual = job['Annual Salary'] + job['Annual Benefits']
-                # Over-earning logic gate: eliminate mitigation jobs paying more than baseline
+        # 2. Dynamic Mitigation & Rate Change Tracker
+        total_interim_earnings = 0.0
+        
+        for _, job in mitigation_jobs.iterrows():
+            if pd.isnull(job['Start Date']) or pd.isnull(job['End Date']):
+                continue
+            
+            job_duration = self._calculate_yearfrac(job['Start Date'], job['End Date'])
+            job_annual = job['Annual Earnings ($)']
+            
+            if is_separation:
+                # Standard Mitigation: Exclude jobs paying more than the "but for" baseline
                 if job_annual < base_annual_comp:
-                    job_duration = self._calculate_yearfrac(job['Start Date'], job['End Date'])
                     total_interim_earnings += (job_duration * job_annual)
+            else:
+                # Pay Change / Demotion Mitigation: Credit the difference between the new rate and the old ongoing rate
+                # (since the old ongoing rate is already factored into baseline_ongoing_earnings)
+                rate_increase = max(0.0, job_annual - actual_ongoing_rate)
+                total_interim_earnings += (job_duration * rate_increase)
                     
-            total_mitigation = total_interim_earnings + actual_paid
-            total_back_pay = max(0.0, total_expected_loss - total_mitigation)
-            
+        total_mitigation = baseline_ongoing_earnings + total_interim_earnings + actual_paid
+        total_back_pay = max(0.0, total_expected_loss - total_mitigation)
+        
         return {
             "Duration (Years)": round(duration, 4),
             "Expected Gross Loss": round(total_expected_loss, 2),
@@ -68,51 +77,56 @@ class TitleVIIDamagesCalculator:
             "Final Back Pay": round(total_back_pay, 2)
         }
 
-    def calculate_front_pay_ev(self, annual_loss_stream, expected_duration_years, 
+    def calculate_front_pay(self, annual_loss_stream, expected_duration_years, 
                                prob_liability, prob_remedy, discount_rate, future_mitigation_annual):
-        ev = 0.0
-        for t in range(1, int(expected_duration_years) + 1):
-            net_loss_t = annual_loss_stream - future_mitigation_annual
-            discounted_t = net_loss_t / ((1 + discount_rate) ** t)
-            ev += max(0.0, discounted_t)
+        
+        # Mid-Range: 1 Year Discounted EV
+        mid_ev = 0.0
+        net_loss_1 = annual_loss_stream - future_mitigation_annual
+        mid_ev += max(0.0, net_loss_1 / ((1 + discount_rate) ** 1))
+        mid_ev = prob_liability * prob_remedy * mid_ev
+        
+        # Best Day: 3 Years Raw (No discounting/prob multipliers applied to max exposure)
+        best_day = max(0.0, (annual_loss_stream - future_mitigation_annual) * 3.0)
+        
+        # Conservative: 0 Years
+        cons_day = 0.0
             
-        return round(prob_liability * prob_remedy * ev, 2)
+        return {"Conservative": cons_day, "Mid-Range": round(mid_ev, 2), "Best Day": round(best_day, 2)}
 
-    def calculate_compensatory_and_punitive(self, uncapped_pecuniary, consolidated_non_pecuniary, 
-                                            severity_multiplier, punitive_requested, 
-                                            is_adea_epa_willful, back_pay_amount):
-        # 1. Uncapped Out-of-Pocket
-        total_uncapped = uncapped_pecuniary
+    def calculate_compensatory(self, uncapped_pecuniary, consolidated_non_pecuniary, 
+                               severity_multiplier, punitive_requested, is_adea_epa_willful, back_pay_amount):
         
-        # 2. Punitive Gate
         punitive_awarded = 0.0 if self.is_government_employer else punitive_requested
-        
-        # 3. Adjusted Non-Pecuniary Baseline
         adjusted_non_pecuniary = consolidated_non_pecuniary * (1.0 + severity_multiplier)
-        
-        # 4. Anti-Double Recovery / Liquidated Damages Gate
         liquidated_damages = back_pay_amount if is_adea_epa_willful else 0.0
         
+        # Calculate Tiers
+        # Best Day = Max Allowed under Cap + Punitive
+        best_capped = min(adjusted_non_pecuniary + punitive_awarded, self.statutory_cap)
+        # Mid-Range = Adjusted Base (No Punitive assumed in mid-range unless requested) + 50% Punitive
+        mid_capped = min(adjusted_non_pecuniary + (punitive_awarded * 0.5), self.statutory_cap)
+        # Conservative = 15% of Adjusted Base, 0 Punitive
+        cons_capped = min(adjusted_non_pecuniary * 0.15, self.statutory_cap)
+        
+        # Anti-Double Recovery logic across all tiers
         if is_adea_epa_willful:
-            # Under ADEA/EPA, emotional distress and punitive are not available; liquidated damages apply instead.
-            # To prevent double recovery if co-pled with Title VII, take whichever remedy provides higher legal recovery.
-            title_vii_capped = min(adjusted_non_pecuniary + punitive_awarded, self.statutory_cap)
-            if liquidated_damages >= title_vii_capped:
-                final_capped_award = liquidated_damages
-                remedy_type = "ADEA/EPA Liquidated Damages (Willful Violation)"
-            else:
-                final_capped_award = title_vii_capped
-                remedy_type = "Title VII Capped Non-Pecuniary & Punitive"
+            best_final = max(liquidated_damages, best_capped)
+            mid_final = max(liquidated_damages, mid_capped)
+            cons_final = max(liquidated_damages * 0.15, cons_capped)
+            remedy_type = "ADEA Liquidated Damages vs Title VII Capped (Higher applied)"
         else:
-            final_capped_award = min(adjusted_non_pecuniary + punitive_awarded, self.statutory_cap)
+            best_final = best_capped
+            mid_final = mid_capped
+            cons_final = cons_capped
             remedy_type = "Title VII / ADA Capped Award"
             
         return {
-            "Uncapped Out-of-Pocket": round(total_uncapped, 2),
-            "Adjusted Non-Pecuniary Claim": round(adjusted_non_pecuniary, 2),
-            "Allowed Capped / Liquidated Award": round(final_capped_award, 2),
-            "Remedy Applied": remedy_type,
-            "Total Compensatory/Liquidated Value": round(total_uncapped + final_capped_award, 2)
+            "Uncapped Out-of-Pocket": round(uncapped_pecuniary, 2),
+            "Conservative": round(cons_final, 2),
+            "Mid-Range": round(mid_final, 2),
+            "Best Day": round(best_final, 2),
+            "Remedy Applied": remedy_type
         }
 
     def estimate_attorney_fees(self, active_phases: list) -> dict:
@@ -132,12 +146,12 @@ class TitleVIIDamagesCalculator:
         return {"Low": low_est, "High": high_est, "Average": (low_est + high_est) / 2}
 
 # --- STREAMLIT USER INTERFACE ---
-st.set_page_config(page_title="Title VII Damages & Litigation Model v1.2", layout="wide")
+st.set_page_config(page_title="Title VII Damages Model v1.2.1", layout="wide")
 
 # Navigation Tabs
 tab_intro, tab_setup, tab_backpay, tab_frontpay, tab_comp, tab_fees, tab_report = st.tabs([
     "🏠 Homepage & Guide", "⚙️ Case Setup", "💵 Back Pay", "📈 Front Pay", 
-    "⚖️ Compensatory & Punitive", "🏛️ Attorney Fees", "📊 Summary & Script Generator"
+    "⚖️ Compensatory & Punitive", "🏛️ Attorney Fees", "📊 Summary Report"
 ])
 
 # --- TAB 1: HOMEPAGE ---
@@ -148,7 +162,8 @@ with tab_intro:
 
     ### Key Methodology & Features
     * **Strict Anti-Double Recovery:** Automatically gates stacked statutory remedies (e.g., ADEA liquidated damages vs. Title VII capped emotional distress) to prevent impermissible double recovery.
-    * **Precision Wage Modeling:** Evaluates salaried compensation alongside fractional hourly baselines, PTO adjustments, and dual-rate wage deficits for demotion or failure-to-promote claims.
+    * **Precision Wage Modeling:** Evaluates salaried compensation alongside fractional hourly baselines, PTO adjustments, and dual-rate wage deficits.
+    * **Universal Mitigation Tracking:** Unrestricted data tables to log job replacements, interim earnings, or subsequent pay raises.
     * **Three-Tier Scenario Evaluation:** Dynamically brackets exposure into **Best Day** (Maximum Plaintiff Recovery), **Mid-Range** (Average Expected Outcome), and **Conservative** (Minimal Exposure) benchmarks.
     * **Risk-Adjusted Defense Settlement Authority:** Scales total predicted exposure by the plaintiff's direct probability of prevailing at trial.
     """)
@@ -221,27 +236,27 @@ with tab_backpay:
     st.info(f"**Calculated Annual Baseline Compensation:** ${base_annual:,.2f}")
 
     st.divider()
-    # Wage Differentials vs Mitigation
     if adverse_action in ["Failure to Promote/Hire", "Demotion with Pay Cut", "Compensation/Hours Reduction"]:
         st.subheader("Dual-Rate Pay Deficit Tracking")
-        st.caption("For non-separation actions, back pay is calculated as the ongoing differential between the sought position and actual earnings.")
+        st.caption("For non-separation actions, input the rate the plaintiff *should* have earned versus what they *actually* earned.")
         col_dif1, col_dif2 = st.columns(2)
         with col_dif1:
             sought_rate = st.number_input("Sought / Promoted Annual Rate ($)", value=base_annual + 15000.0, step=1000.0)
         with col_dif2:
             actual_ongoing = st.number_input("Actual Ongoing Annual Rate ($)", value=base_annual, step=1000.0)
-        mitigation_df = pd.DataFrame()
-        actual_paid = st.number_input("Additional Interim Severance or Lump Sum Offsets ($)", value=0.0, step=500.0)
     else:
-        st.subheader("Interim Earnings & Mitigation")
-        st.caption("Enter replacement jobs accepted post-separation. Higher-paying replacement jobs are automatically excluded from deductions.")
-        if "mit_df" not in st.session_state:
-            st.session_state.mit_df = pd.DataFrame(columns=["Start Date", "End Date", "Annual Salary", "Annual Benefits"])
-        mitigation_df = st.data_editor(st.session_state.mit_df, num_rows="dynamic", use_container_width=True)
         sought_rate, actual_ongoing = base_annual, 0.0
-        actual_paid = st.number_input("Actual Earnings or Severance Paid by Defendant ($)", value=0.0, step=500.0)
+
+    st.subheader("Mitigation & Pay Change Tracker")
+    st.caption("For terminations: Enter replacement jobs (higher-paying jobs are automatically excluded). For demotions/promotions: Enter the dates and amounts of any subsequent pay raises with this employer.")
+    if "mit_df" not in st.session_state:
+        st.session_state.mit_df = pd.DataFrame(columns=["Description", "Start Date", "End Date", "Annual Earnings ($)"])
+    mitigation_df = st.data_editor(st.session_state.mit_df, num_rows="dynamic", use_container_width=True)
+    
+    actual_paid = st.number_input("Additional Severance or Lump Sum Offsets Paid by Defendant ($)", value=0.0, step=500.0)
 
     bp_results = model.calculate_back_pay(start_date, end_date, base_annual, adverse_action, actual_ongoing, sought_rate, mitigation_df, actual_paid)
+    st.write(f"**Net Back Pay Deficit:** ${bp_results['Final Back Pay']:,.2f}")
 
 # --- TAB 4: FRONT PAY ---
 with tab_frontpay:
@@ -249,14 +264,13 @@ with tab_frontpay:
     st.caption("Front pay is an equitable remedy awarded from the date of judgment forward when workplace reinstatement is unfeasible.")
     col_fp1, col_fp2 = st.columns(2)
     with col_fp1:
-        fp_years = st.number_input("Projected Duration (Years)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
         fp_prob_rem = st.slider("Judicial Probability of Granting Front Pay (%)", 0, 100, 50) / 100.0
     with col_fp2:
         fp_discount = st.number_input("Discount Rate (Safe Treasury Yield)", value=0.03, step=0.005)
         fp_mitigation = st.number_input("Expected Future Annual Mitigation ($)", value=45000.0 if adverse_action in ["Termination / Discharge", "Constructive Discharge"] else actual_ongoing, step=1000.0)
 
     annual_loss_stream = (sought_rate - actual_ongoing) if adverse_action in ["Failure to Promote/Hire", "Demotion with Pay Cut"] else base_annual
-    fp_ev = model.calculate_front_pay_ev(annual_loss_stream, fp_years, 1.0, fp_prob_rem, fp_discount, fp_mitigation)
+    fp_results = model.calculate_front_pay(annual_loss_stream, 1.0, 1.0, fp_prob_rem, fp_discount, fp_mitigation)
 
 # --- TAB 5: COMPENSATORY & PUNITIVE ---
 with tab_comp:
@@ -288,8 +302,7 @@ with tab_comp:
     req_punitive = st.radio("Are Punitive Damages Explicitly Requested in Complaint?", ["Yes", "No"], index=0)
     pun_amt = st.number_input("Requested Punitive Amount ($)", value=250000.0 if req_punitive == "Yes" else 0.0, step=10000.0) if req_punitive == "Yes" else 0.0
     
-    comp_results = model.calculate_compensatory_and_punitive(total_uncapped_pec, non_pec_base, sev_mult, pun_amt, is_willful, bp_results["Final Back Pay"])
-    st.info(f"**Applicable Remedy Mechanism:** {comp_results['Remedy Applied']} | **Net Allowed Non-Economic Award:** ${comp_results['Allowed Capped / Liquidated Award']:,.2f}")
+    comp_results = model.calculate_compensatory(total_uncapped_pec, non_pec_base, sev_mult, pun_amt, is_willful, bp_results["Final Back Pay"])
 
 # --- TAB 6: ATTORNEY FEES ---
 with tab_fees:
@@ -311,26 +324,64 @@ with tab_fees:
                 
     fee_results = model.estimate_attorney_fees(selected_phases)
 
-# --- TAB 7: SUMMARY & SCRIPT GENERATOR ---
+# --- TAB 7: SUMMARY REPORT ---
 with tab_report:
-    st.header("Executive Exposure Dashboard & Settlement Script")
+    st.header("Executive Exposure Dashboard & Summary Report")
     
-    # Three-Tier Scenarios
-    best_day = bp_results["Final Back Pay"] + (bp_results["Final Back Pay"] if is_willful else 0.0) + (3.0 * annual_loss_stream) + comp_results["Allowed Capped / Liquidated Award"] + total_uncapped_pec + fee_results["High"]
-    mid_range = bp_results["Final Back Pay"] + fp_ev + comp_results["Total Compensatory/Liquidated Value"] + fee_results["Average"]
-    conservative = bp_results["Final Back Pay"] + total_uncapped_pec + (0.15 * comp_results["Allowed Capped / Liquidated Award"]) + fee_results["Low"]
+    # Compile 3-Tier Summary Matrix
+    summary_data = {
+        "Damage Category": [
+            "Back Pay", 
+            "Front Pay", 
+            "Compensatory (Uncapped)", 
+            "Compensatory/Liquidated (Capped)", 
+            "Attorney Fees", 
+            "TOTAL EXPOSURE"
+        ],
+        "Conservative": [
+            bp_results["Final Back Pay"],
+            fp_results["Conservative"],
+            comp_results["Uncapped Out-of-Pocket"],
+            comp_results["Conservative"],
+            fee_results["Low"],
+            bp_results["Final Back Pay"] + fp_results["Conservative"] + comp_results["Uncapped Out-of-Pocket"] + comp_results["Conservative"] + fee_results["Low"]
+        ],
+        "Mid-Range": [
+            bp_results["Final Back Pay"],
+            fp_results["Mid-Range"],
+            comp_results["Uncapped Out-of-Pocket"],
+            comp_results["Mid-Range"],
+            fee_results["Average"],
+            bp_results["Final Back Pay"] + fp_results["Mid-Range"] + comp_results["Uncapped Out-of-Pocket"] + comp_results["Mid-Range"] + fee_results["Average"]
+        ],
+        "Best Day": [
+            bp_results["Final Back Pay"],
+            fp_results["Best Day"],
+            comp_results["Uncapped Out-of-Pocket"],
+            comp_results["Best Day"],
+            fee_results["High"],
+            bp_results["Final Back Pay"] + fp_results["Best Day"] + comp_results["Uncapped Out-of-Pocket"] + comp_results["Best Day"] + fee_results["High"]
+        ]
+    }
     
-    defense_settlement_value = mid_range * win_prob
+    summary_df = pd.DataFrame(summary_data)
     
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("Best Day (Max Exposure)", f"${best_day:,.2f}")
-    col_m2.metric("Mid-Range Expected", f"${mid_range:,.2f}")
-    col_m3.metric("Conservative Exposure", f"${conservative:,.2f}")
-    col_m4.metric("Defense Settlement Value", f"${defense_settlement_value:,.2f}", help=f"Mid-Range adjusted by {win_prob*100:.0f}% Plaintiff Win Probability")
+    # Calculate Settlement Value based on Mid-Range * Win Prob
+    mid_total = summary_df.loc[summary_df["Damage Category"] == "TOTAL EXPOSURE", "Mid-Range"].values[0]
+    defense_settlement_value = mid_total * win_prob
+    
+    st.metric("Risk-Adjusted Defense Settlement Value", f"${defense_settlement_value:,.2f}", help=f"Mid-Range Exposure adjusted by {win_prob*100:.0f}% Plaintiff Win Probability")
+    
+    st.subheader("Comprehensive 3-Tier Damage Estimation Table")
+    st.dataframe(summary_df.style.format({
+        "Conservative": "${:,.2f}", 
+        "Mid-Range": "${:,.2f}", 
+        "Best Day": "${:,.2f}"
+    }), use_container_width=True, hide_index=True)
     
     st.divider()
     st.subheader("Confidential Settlement Memo Narrative Script")
-    st.caption("Copy and paste this formally formatted, bullet-free assessment directly into mediation statements or confidential client evaluation memos.")
+    st.caption("Copy and paste this formally formatted assessment directly into mediation statements or confidential client evaluation memos.")
     
     # Construct Narrative Paragraph
     action_desc = adverse_action.lower()
@@ -341,15 +392,15 @@ with tab_report:
     )
     
     if is_willful:
-        script_text += f"Because Plaintiff asserts a willful violation under the {statute}, exposure includes potential statutory liquidated damages doubling the net back pay award to an aggregate wage loss claim of ${(bp_results['Final Back Pay']*2):,.2f}, which legally supersedes and locks out standard Title VII non-economic compensatory caps. "
+        script_text += f"Because Plaintiff asserts a willful violation under the {statute}, exposure includes potential statutory liquidated damages effectively doubling the net back pay award to an aggregate wage loss claim of ${(bp_results['Final Back Pay']*2):,.2f}, which legally supersedes and locks out standard Title VII non-economic compensatory caps. "
     else:
-        script_text += f"In addition to wage loss, Plaintiff seeks non-pecuniary compensatory damages for emotional distress and reputational harm, which are strictly constrained by federal statutory caps of ${model.statutory_cap:,.2f} based on defendant's organizational headcount, alongside out-of-pocket pecuniary expenses of ${total_uncapped_pec:,.2f}. "
+        script_text += f"In addition to wage loss, Plaintiff seeks non-pecuniary compensatory damages for emotional distress and reputational harm, which are strictly constrained by federal statutory caps of ${model.statutory_cap:,.2f} based on organizational headcount, alongside out-of-pocket pecuniary expenses of ${total_uncapped_pec:,.2f}. "
         
     if is_gov:
         script_text += f"Furthermore, because Defendant {defendant_name} operates as a governmental state agency, sovereign immunity strictly bars the recovery of punitive damages as a matter of law. "
         
     script_text += (
-        f"When factoring projected statutory attorney fee shifting under the lodestar method averaging ${fee_results['Average']:,.2f} alongside equitable front pay probabilities, total mid-range trial exposure is estimated at ${mid_range:,.2f}. "
+        f"When factoring projected statutory attorney fee shifting under the lodestar method averaging ${fee_results['Average']:,.2f} alongside equitable front pay probabilities, total mid-range trial exposure is estimated at ${mid_total:,.2f}. "
         f"Applying a rigorous defense risk-adjustment reflecting a {win_prob*100:.0f}% direct liability probability of adverse judicial finding, realistic defense settlement authority is objectively established at ${defense_settlement_value:,.2f}."
     )
     
@@ -357,7 +408,13 @@ with tab_report:
     
     st.download_button(
         label="📄 Download 1-Page Summary Report (TXT)",
-        data=f"EXECUTIVE DAMAGES SUMMARY\nCase: {plaintiff_name} v. {defendant_name}\nDate: {datetime.date.today()}\n\nBest Day Exposure: ${best_day:,.2f}\nMid-Range Exposure: ${mid_range:,.2f}\nConservative Exposure: ${conservative:,.2f}\nDefense Settlement Value: ${defense_settlement_value:,.2f}\n\nNARRATIVE SCRIPT:\n{script_text}",
+        data=f"EXECUTIVE DAMAGES SUMMARY\nCase: {plaintiff_name} v. {defendant_name}\nDate: {datetime.date.today()}\n\n"
+             f"--- THREE-TIER EXPOSURE ---\n"
+             f"Best Day Exposure: ${summary_data['Best Day'][-1]:,.2f}\n"
+             f"Mid-Range Exposure: ${mid_total:,.2f}\n"
+             f"Conservative Exposure: ${summary_data['Conservative'][-1]:,.2f}\n\n"
+             f"Defense Settlement Value: ${defense_settlement_value:,.2f}\n\n"
+             f"--- NARRATIVE SCRIPT ---\n{script_text}",
         file_name=f"Damages_Report_{plaintiff_name.replace(' ', '_')}.txt",
         mime="text/plain"
     )
