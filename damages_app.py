@@ -20,11 +20,10 @@ class TitleVIIDamagesCalculator:
         else: return 300000.0
 
     def _calculate_yearfrac(self, start_date, end_date) -> float:
-        if isinstance(start_date, str):
-            start_date = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
-        if isinstance(end_date, str):
-            end_date = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
-        return max(0.0, (end_date - start_date).days / 365.25)
+        # Convert any input type (str, date, Timestamp) robustly using pandas
+        d1 = pd.to_datetime(start_date).date()
+        d2 = pd.to_datetime(end_date).date()
+        return max(0.0, (d2 - d1).days / 365.25)
 
     def calculate_base_annual_compensation(self, is_hourly: bool, hourly_rate: float, weekly_hours: float, 
                                            unpaid_leave_hours: float, annual_salary: float, annual_benefits: float) -> float:
@@ -251,7 +250,18 @@ with tab_backpay:
     st.caption("For terminations: Enter replacement jobs (higher-paying jobs are automatically excluded). For demotions/promotions: Enter the dates and amounts of any subsequent pay raises with this employer.")
     if "mit_df" not in st.session_state:
         st.session_state.mit_df = pd.DataFrame(columns=["Description", "Start Date", "End Date", "Annual Earnings ($)"])
-    mitigation_df = st.data_editor(st.session_state.mit_df, num_rows="dynamic", use_container_width=True)
+    
+    # Updated st.data_editor with column_config to enforce calendar widgets for dates
+    mitigation_df = st.data_editor(
+        st.session_state.mit_df, 
+        num_rows="dynamic", 
+        use_container_width=True,
+        column_config={
+            "Start Date": st.column_config.DateColumn("Start Date"),
+            "End Date": st.column_config.DateColumn("End Date"),
+            "Annual Earnings ($)": st.column_config.NumberColumn("Annual Earnings ($)", min_value=0.0, format="$%.2f")
+        }
+    )
     
     actual_paid = st.number_input("Additional Severance or Lump Sum Offsets Paid by Defendant ($)", value=0.0, step=500.0)
 
