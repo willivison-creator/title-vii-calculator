@@ -1,0 +1,2 @@
+- name: Gemini Actions
+  uses: dortort/gemini-actions@v0.1.0
